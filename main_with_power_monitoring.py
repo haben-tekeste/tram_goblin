@@ -4,13 +4,25 @@ import display_manager as dm
 import combine_btn_motion as bm
 from smarthouse_power_monitor import SmartHousePowerMonitor
 import dht
-from machine import Pin
+from machine import Pin, PWM
+import machine
 
 # Initialize DHT sensor for temperature readings
 dht_sensor = dht.DHT11(Pin(17))
 
 # Initialize PowerGoblin integration (update with your PowerGoblin server address)
 power_monitor = SmartHousePowerMonitor(goblin_host="10.0.0.201:8080")
+
+# Initialize Fan Control Pins
+INA = PWM(Pin(27, Pin.OUT), 10000)  # INA corresponds to IN+
+INB = PWM(Pin(18, Pin.OUT), 10000)  # INB corresponds to IN-
+
+# Initialize Button for door control
+door_button = Pin(26, Pin.IN, Pin.PULL_UP)  # Button for opening/closing the door
+
+# Initialize PWM for Servo (Door control)
+door_servo = PWM(Pin(5))  
+door_servo.freq(50)
 
 # Global variables to track state
 door_open = False
@@ -32,7 +44,10 @@ def toggle_door_state():
     global door_open
     door_open = not door_open
     
-    # Update fan state based on door state
+    # Physically control the door
+    control_door(door_open)
+    
+    # Update fan state based on door state (fan off when door open)
     update_fan_state(not door_open)
     
     # Log door state change for power monitoring
@@ -40,15 +55,42 @@ def toggle_door_state():
     
     return door_open
 
+def control_door(open_door):
+    """Control the physical door servo"""
+    if open_door:
+        door_servo.duty(77)  # Door open (90 degrees)
+        print("Door opened.")
+    else:
+        door_servo.duty(25)  # Door closed (0 degrees)
+        print("Door closed.")
+
 def update_fan_state(active):
     """Update the fan state and log power changes"""
     global fan_active
     fan_active = active
     
+    # Physically control the fan
+    if active:
+        activate_fan()
+    else:
+        deactivate_fan()
+    
     # Log fan state change for power monitoring
     power_monitor.log_fan_state_change(fan_active)
     
     return fan_active
+
+def activate_fan():
+    """Turn on the fan"""
+    INA.duty(0)    # Fan control forward direction
+    INB.duty(700)  # Set duty cycle to rotate the fan
+    print("Fan activated")
+
+def deactivate_fan():
+    """Turn off the fan"""
+    INA.duty(0)   # Stop fan
+    INB.duty(0)   # Stop fan
+    print("Fan deactivated")
 
 def trigger_alert(alert_message):
     """Trigger system alert and log power consumption change"""
@@ -63,6 +105,16 @@ def trigger_alert(alert_message):
     
     # Activate emergency signals
     bm.activate_brake_and_warning()
+
+def check_button_press():
+    """Check if door button is pressed and handle the press"""
+    if door_button.value() == 0:  # Button pressed (active low)
+        time.sleep(0.01)  # Delay to debounce the button
+        while door_button.value() == 0:
+            pass  # Wait for button release
+        toggle_door_state()  # Toggle door state
+        return True
+    return False
 
 def main():
     print("Starting smart house system with power monitoring")
@@ -81,11 +133,20 @@ def main():
     alert_timer = time.time()
     temp_log_timer = time.time()
     
+    # Initialize door to closed state
+    control_door(door_open)
+    
+    # Initialize fan based on door state (on if door closed)
+    update_fan_state(not door_open)
+    
     print("Starting main control loop")
     
     try:
         while True:
             current_time = time.time()
+            
+            # Check for door button press
+            button_pressed = check_button_press()
             
             # Check and log temperature every 60 seconds
             if current_time - temp_log_timer > 60:
@@ -144,11 +205,23 @@ def main():
         # Clean shutdown on keyboard interrupt
         print("Shutting down smart house system")
         power_monitor.stop_power_measurement()
+        
+        # Ensure fan is off and door is closed
+        deactivate_fan()
+        control_door(False)
     
     except Exception as e:
         # Log any errors and attempt to stop power measurement
         print(f"Error in main loop: {e}")
         power_monitor.stop_power_measurement()
+        
+        # Attempt to safely shutdown hardware
+        try:
+            deactivate_fan() 
+            control_door(False)
+        except:
+            pass
+        
         raise
 
 if __name__ == "__main__":
